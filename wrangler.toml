@@ -1,0 +1,31 @@
+name = "images-worker"
+main = "worker.js"
+compatibility_date = "2024-04-05"
+
+[observability]
+[observability.logs]
+enabled = false
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[[r2_buckets]]
+binding = "IMAGES"
+bucket_name = "images"
+
+[[kv_namespaces]]
+binding = "METADATA"
+id = "64d0f3129ed1417f9eae7f8f41e5fb00"
+
+[[kv_namespaces]]
+binding = "KV_PROGRESS"
+id = "98883411a5394436b7a09b1e85e0b999"
+
+[durable_objects]
+bindings = [
+  { name = "BulkProcessor", class_name = "BulkProcessor" }
+]
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["BulkProcessor"]

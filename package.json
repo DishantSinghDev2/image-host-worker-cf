@@ -1,0 +1,14 @@
+{
+  "name": "image-host-worker-cf",
+  "version": "1.0.0",
+  "description": "A cloudflare worker for image hosting with bulk upload capabilities",
+  "main": "worker.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "wrangler": "^4.53.0"
+  }
+}
