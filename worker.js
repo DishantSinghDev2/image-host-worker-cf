@@ -1,6 +1,5 @@
-// image-worker (final)
+// image-worker (CORS Fixed)
 // Bindings: IMAGES (R2), METADATA (KV), BulkProcessor (Durable Object)
-// Note: KV_PROGRESS binding is listed in requirements but replaced by Durable Object storage for better consistency.
 
 const DEF_MAX_MB = 35;
 const R2_BINDING = "IMAGES";
@@ -9,6 +8,13 @@ const DO_BINDING = "BulkProcessor";
 
 const now = () => Math.floor(Date.now() / 1000);
 const BULK_LIMIT = 100;
+
+// --- CORS HEADERS (The Fix) ---
+const CORS_HEADERS = {
+    "Access-Control-Allow-Origin": "*", // Allows any domain. Change to specific domain for stricter security.
+    "Access-Control-Allow-Methods": "GET, HEAD, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, x-api-key, x-auth-ts, x-auth-sig, x-ultra-key, x-pro-key",
+};
 
 // --- Helper Functions ---
 
@@ -26,6 +32,16 @@ const hmac = async (secret, msg) => {
     const key = await crypto.subtle.importKey("raw", te.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]);
     const sig = await crypto.subtle.sign("HMAC", key, te.encode(msg));
     return toB64Url(new Uint8Array(sig));
+};
+
+// Helper for Temp Token Verification
+const verifyTempToken = async (env, timestamp, signature) => {
+    const ts = Number(timestamp);
+    const nowTime = Math.floor(Date.now() / 1000);
+    // Valid for 5 minutes window
+    if (Math.abs(nowTime - ts) > 300) return false;
+    const expected = await hmac(env.DELETE_SECRET, `upload:${ts}`);
+    return expected === signature;
 };
 
 const extOf = m => {
@@ -80,17 +96,30 @@ const getR2 = async (env, key) => {
 
 const CACHE_HEADERS = { "Cache-Control": "public, max-age=31536000, immutable" };
 
+// Updated response helpers to inject CORS headers
 const jsonErrNoStore = (c, m) => new Response(JSON.stringify({ success: false, status: c, message: m }), {
     status: c,
-    headers: { "content-type": "application/json", "Cache-Control": "no-store, no-cache, must-revalidate" }
+    headers: { 
+        "content-type": "application/json", 
+        "Cache-Control": "no-store, no-cache, must-revalidate",
+        ...CORS_HEADERS 
+    }
 });
 
 const jsonErr = (c, m) => new Response(JSON.stringify({ success: false, status: c, message: m }), {
     status: c,
-    headers: { "content-type": "application/json" }
+    headers: { 
+        "content-type": "application/json",
+        ...CORS_HEADERS
+    }
 });
 
-const jsonOK = obj => new Response(JSON.stringify(obj), { headers: { "content-type": "application/json" } });
+const jsonOK = obj => new Response(JSON.stringify(obj), { 
+    headers: { 
+        "content-type": "application/json",
+        ...CORS_HEADERS
+    } 
+});
 
 const fmtResp = m => ({
     data: {
@@ -123,7 +152,7 @@ async function purgeLocalCache(hostname, id) {
         const cache = caches.default;
         const protocols = ["https://", "http://"];
         const uris = [`${hostname}/i/${id}`, `${hostname}/i/${id}/`];
-        
+
         const promises = [];
         for (const proto of protocols) {
             for (const uri of uris) {
@@ -135,8 +164,8 @@ async function purgeLocalCache(hostname, id) {
 }
 
 async function cleanupExpired(env, id, meta, hostname) {
-    try { 
-        if (meta?.filename) await env[R2_BINDING].delete(meta.filename).catch(() => { }); 
+    try {
+        if (meta?.filename) await env[R2_BINDING].delete(meta.filename).catch(() => { });
     } catch { }
     try { await env[META_BINDING].delete(id); } catch { }
     if (hostname) await purgeLocalCache(hostname, id);
@@ -154,6 +183,14 @@ async function checkAndExpire(env, id, meta, hostname) {
 
 export default {
     async fetch(req, env) {
+        // --- HANDLE PREFLIGHT (OPTIONS) ---
+        if (req.method === "OPTIONS") {
+            return new Response(null, {
+                status: 204,
+                headers: CORS_HEADERS
+            });
+        }
+
         const url = new URL(req.url);
         const path = url.pathname.replace(/\/+$/, "") || "/";
         const MAX = Number(env.MAX_UPLOAD_MB || DEF_MAX_MB);
@@ -162,25 +199,23 @@ export default {
             s = (s || "").trim();
             if (!s) return { err: "empty" };
 
-            // 1. Self-URL Import (Optimization: Copy R2 object directly)
+            // 1. Self-URL Import
             try {
                 const u = new URL(s);
                 const hostMatches =
                     u.hostname === url.hostname ||
                     (env.LEGACY_BASE && new URL(env.LEGACY_BASE).hostname === u.hostname);
-                
+
                 const parts = u.pathname.split("/").filter(Boolean);
-                // Matches /i/ID structure
                 if (hostMatches && parts.length >= 2 && parts[0] === "i") {
                     const id = parts[1];
                     const metaRaw = await env[META_BINDING].get(id);
                     if (!metaRaw) return { err: "bad url" };
                     const meta = JSON.parse(metaRaw);
-                    
-                    // Retrieve from R2 directly
+
                     const obj = await getR2(env, meta.filename);
                     if (!obj) return { err: "bad url" };
-                    
+
                     const mime = obj.h.get("content-type") || detectMime(obj.ab) || "application/octet-stream";
                     return { ok: true, body: obj.ab, mime };
                 }
@@ -237,14 +272,13 @@ export default {
                 let name = "", expiration = 0, mime = "application/octet-stream", body = null;
                 const ct = (req.headers.get("content-type") || "").toLowerCase();
 
-                // Multipart Form
                 if (ct.includes("multipart/form-data")) {
                     const form = await req.formData();
                     const item = form.get("image");
                     if (!item) return jsonErr(400, "image required");
                     name = (form.get("name") || "") + "";
                     expiration = Number(form.get("expiration") || 0);
-                    
+
                     if (item instanceof Blob) {
                         const ab = await item.arrayBuffer();
                         if (ab.byteLength > MAX * 1024 * 1024) return jsonErr(413, "too large");
@@ -258,7 +292,6 @@ export default {
                         body = out.body;
                     } else return jsonErr(400, "invalid image field");
                 }
-                // JSON
                 else {
                     const j = await req.json().catch(() => ({}));
                     const img = j.image;
@@ -314,18 +347,38 @@ export default {
                 const mainFile = meta?.filename || `${id}.jpeg`;
                 const ro = await getR2(env, mainFile);
                 if (ro) {
-                    const r = new Response(ro.ab, { headers: { ...Object.fromEntries(ro.h), ...CACHE_HEADERS, "Content-Disposition": `inline; filename="${mainFile}"` } });
-                    // Cache the valid response
+                    const r = new Response(ro.ab, { 
+                        headers: { 
+                            ...Object.fromEntries(ro.h), 
+                            ...CACHE_HEADERS, 
+                            "Content-Disposition": `inline; filename="${mainFile}"`,
+                            ...CORS_HEADERS // Include CORS here too for JS fetch()
+                        } 
+                    });
                     await cache.put(ck, r.clone());
                     return r;
                 }
                 return jsonErrNoStore(404, "not found");
             }
 
-            // --- Bulk Upload Start (Durable Object) ---
+            // --- Bulk Upload Start ---
             if (req.method === "POST" && path === "/bulk-upload") {
-                const key = req.headers.get("x-api-key");
-                if (!key || key !== env.MASTER_API_KEY) return jsonErr(401, "Unauthorized");
+                const authKey = req.headers.get("x-api-key");
+
+                let isAuthorized = false;
+
+                if (authKey === env.MASTER_API_KEY) {
+                    isAuthorized = true;
+                }
+                else {
+                    const ts = req.headers.get("x-auth-ts");
+                    const sig = req.headers.get("x-auth-sig");
+                    if (ts && sig && await verifyTempToken(env, ts, sig)) {
+                        isAuthorized = true;
+                    }
+                }
+
+                if (!isAuthorized) return jsonErr(401, "Unauthorized");
 
                 const ct = (req.headers.get("content-type") || "").toLowerCase();
                 if (!ct.includes("multipart/form-data")) return jsonErr(400, "multipart required");
@@ -339,13 +392,12 @@ export default {
 
                 const batchId = randId(12);
 
-                // Get Durable Object Stub
                 const id = env[DO_BINDING].idFromName(batchId);
                 const stub = env[DO_BINDING].get(id);
 
                 const doForm = new FormData();
                 items.forEach(f => doForm.append("files[]", f));
-                doForm.append("expiration", expiration); 
+                doForm.append("expiration", expiration);
 
                 await stub.fetch("https://do/init", {
                     method: "POST",
@@ -366,21 +418,26 @@ export default {
 
                 const id = env[DO_BINDING].idFromName(batchId);
                 const stub = env[DO_BINDING].get(id);
-                return await stub.fetch("https://do/status");
+                // We must return response with CORS headers, but DO returns "raw" response
+                const res = await stub.fetch("https://do/status");
+                
+                // Proxy logic: recreate response to attach CORS
+                const data = await res.json();
+                return jsonOK(data); 
             }
 
             // --- Delete Confirmation Page ---
             if (req.method === "GET" && path.startsWith("/delete/")) {
                 const [_, id, token] = path.split("/").filter(Boolean);
                 if (!id || !token) return jsonErr(400, "bad delete url");
-                
+
                 const raw = await env[META_BINDING].get(id);
                 if (!raw) return jsonErr(404, "not found");
-                
+
                 const meta = JSON.parse(raw);
                 const expected = await hmac(env.DELETE_SECRET, `${id}:${meta.time}`);
                 if (expected !== token) return jsonErr(403, "invalid token");
-                
+
                 const html = `<!doctype html><meta charset="utf-8"><body style="font-family:system-ui;padding:20px"><h3>Delete ${id}?</h3><form method="post" action="/delete-confirm/${id}/${token}"><button>Delete</button></form></body>`;
                 return new Response(html, { headers: { "content-type": "text/html;charset=utf-8" } });
             }
@@ -389,27 +446,20 @@ export default {
             if (req.method === "POST" && path.startsWith("/delete-confirm/")) {
                 const [_, id, token] = path.split("/").filter(Boolean);
                 if (!id || !token) return jsonErr(400, "bad delete url");
-                
+
                 const raw = await env[META_BINDING].get(id);
                 if (!raw) return jsonErr(404, "not found");
-                
+
                 const meta = JSON.parse(raw);
                 const expected = await hmac(env.DELETE_SECRET, `${id}:${meta.time}`);
                 if (expected !== token) return jsonErr(403, "invalid token");
 
-                // 1. Delete R2
                 try { await env[R2_BINDING].delete(meta.filename); } catch { }
-                
-                // 2. Legacy Delete (optional)
                 try {
                     const base = (env.LEGACY_BASE || "").replace(/\/$/, "");
                     if (base) await fetch(`${base}/delete/${id}`, { method: "POST", headers: { "X-Bypass-Worker": "1" } });
                 } catch { }
-                
-                // 3. Delete Metadata
                 await env[META_BINDING].delete(id);
-
-                // 4. Aggressive Cache Purge
                 await purgeLocalCache(url.hostname, id);
 
                 return new Response(`<html><body><h3>Deleted ${id}</h3></body></html>`, {
@@ -417,7 +467,7 @@ export default {
                 });
             }
 
-            return new Response("ok");
+            return new Response("ok", { headers: CORS_HEADERS });
         } catch (err) {
             return jsonErr(500, String(err));
         }
@@ -427,98 +477,93 @@ export default {
 // --- Durable Object Class ---
 
 export class BulkProcessor {
-  constructor(state, env) {
-    this.state = state;
-    this.env = env;
-  }
-
-  async fetch(req) {
-    const url = new URL(req.url);
-
-    // 1. INIT & START
-    if (req.method === "POST" && url.pathname === "/init") {
-      const batchId = req.headers.get("X-BATCH-ID");
-      const host = req.headers.get("X-HOST");
-      const form = await req.formData();
-      const files = form.getAll("files[]");
-      const expiration = form.get("expiration");
-
-      const initialState = {
-        batchId,
-        total: files.length,
-        completed: 0,
-        failed: 0,
-        items: [],
-        percent: 0,
-        done: false
-      };
-      await this.state.storage.put("status", initialState);
-
-      this.state.waitUntil(this.processFiles(files, host, expiration));
-
-      return new Response("started");
+    constructor(state, env) {
+        this.state = state;
+        this.env = env;
     }
 
-    // 2. CHECK STATUS
-    if (url.pathname === "/status") {
-      const status = await this.state.storage.get("status");
-      if (!status) return jsonErr(404, "Batch not found");
-      return jsonOK(status);
-    }
+    async fetch(req) {
+        const url = new URL(req.url);
 
-    return new Response("ok");
-  }
+        if (req.method === "POST" && url.pathname === "/init") {
+            const batchId = req.headers.get("X-BATCH-ID");
+            const host = req.headers.get("X-HOST");
+            const form = await req.formData();
+            const files = form.getAll("files[]");
+            const expiration = form.get("expiration");
 
-  async processFiles(files, host, expiration) {
-    let currentStatus = await this.state.storage.get("status");
+            const initialState = {
+                batchId,
+                total: files.length,
+                completed: 0,
+                failed: 0,
+                items: [],
+                percent: 0,
+                done: false
+            };
+            await this.state.storage.put("status", initialState);
 
-    const processOne = async (file) => {
-      try {
-        const ab = await file.arrayBuffer();
-        const mime = file.type || detectMime(ab) || "application/octet-stream";
-        const ext = extOf(mime);
-        const id = randId();
-        const fname = `${id}.${ext}`;
-        const publicUrl = `https://${host}/i/${id}`;
+            this.state.waitUntil(this.processFiles(files, host, expiration));
 
-        // Upload to R2
-        await this.env[R2_BINDING].put(fname, ab, { httpMetadata: { contentType: mime } });
-
-        // Save Metadata (with expiration)
-        const meta = {
-          id, name: id, filename: fname, mime, extension: ext,
-          time: now(), 
-          expiration: Number(expiration) || 0,
-          url: publicUrl, plan: "free"
-        };
-        await this.env[META_BINDING].put(id, JSON.stringify(meta));
-
-        return { success: true, id, url: publicUrl };
-      } catch (e) {
-        return { success: false, error: e.message };
-      }
-    };
-
-    // Parallel Processing (Chunks of 5)
-    const CHUNK_SIZE = 5;
-    for (let i = 0; i < files.length; i += CHUNK_SIZE) {
-      const chunk = files.slice(i, i + CHUNK_SIZE);
-      const results = await Promise.all(chunk.map(f => processOne(f)));
-
-      currentStatus = await this.state.storage.get("status");
-      
-      for (const res of results) {
-        if (res.success) {
-          currentStatus.completed++;
-          currentStatus.items.push({ id: res.id, url: res.url, done: true });
-        } else {
-          currentStatus.failed++;
-          currentStatus.items.push({ error: res.error, done: true });
+            return new Response("started");
         }
-      }
 
-      currentStatus.percent = currentStatus.total ? Math.round(((currentStatus.completed + currentStatus.failed) / currentStatus.total) * 100) : 0;
-      await this.state.storage.put("status", currentStatus);
+        if (url.pathname === "/status") {
+            const status = await this.state.storage.get("status");
+            if (!status) return new Response(JSON.stringify({ error: "not found" }), { status: 404 });
+            return new Response(JSON.stringify(status), { headers: { "Content-Type": "application/json" } });
+        }
+
+        return new Response("ok");
     }
-  }
+
+    async processFiles(files, host, expiration) {
+        let currentStatus = await this.state.storage.get("status");
+
+        const processOne = async (file) => {
+            try {
+                const ab = await file.arrayBuffer();
+                const mime = file.type || detectMime(ab) || "application/octet-stream";
+                const ext = extOf(mime);
+                const id = randId();
+                const fname = `${id}.${ext}`;
+                const publicUrl = `https://${host}/i/${id}`;
+
+                await this.env[R2_BINDING].put(fname, ab, { httpMetadata: { contentType: mime } });
+
+                const meta = {
+                    id, name: id, filename: fname, mime, extension: ext,
+                    time: now(),
+                    expiration: Number(expiration) || 0,
+                    url: publicUrl, plan: "free"
+                };
+                await this.env[META_BINDING].put(id, JSON.stringify(meta));
+
+                return { success: true, id, url: publicUrl };
+            } catch (e) {
+                return { success: false, error: e.message };
+            }
+        };
+
+        const CHUNK_SIZE = 5;
+        for (let i = 0; i < files.length; i += CHUNK_SIZE) {
+            const chunk = files.slice(i, i + CHUNK_SIZE);
+            const results = await Promise.all(chunk.map(f => processOne(f)));
+
+            currentStatus = await this.state.storage.get("status");
+
+            for (const res of results) {
+                if (res.success) {
+                    currentStatus.completed++;
+                    currentStatus.items.push({ id: res.id, url: res.url, done: true });
+                } else {
+                    currentStatus.failed++;
+                    currentStatus.items.push({ error: res.error, done: true });
+                }
+            }
+
+            currentStatus.percent = currentStatus.total ? Math.round(((currentStatus.completed + currentStatus.failed) / currentStatus.total) * 100) : 0;
+            await this.state.storage.put("status", currentStatus);
+        }
+    }
 }
