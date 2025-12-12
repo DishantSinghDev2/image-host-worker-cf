@@ -99,26 +99,26 @@ const CACHE_HEADERS = { "Cache-Control": "public, max-age=31536000, immutable" }
 // Updated response helpers to inject CORS headers
 const jsonErrNoStore = (c, m) => new Response(JSON.stringify({ success: false, status: c, message: m }), {
     status: c,
-    headers: { 
-        "content-type": "application/json", 
+    headers: {
+        "content-type": "application/json",
         "Cache-Control": "no-store, no-cache, must-revalidate",
-        ...CORS_HEADERS 
+        ...CORS_HEADERS
     }
 });
 
 const jsonErr = (c, m) => new Response(JSON.stringify({ success: false, status: c, message: m }), {
     status: c,
-    headers: { 
+    headers: {
         "content-type": "application/json",
         ...CORS_HEADERS
     }
 });
 
-const jsonOK = obj => new Response(JSON.stringify(obj), { 
-    headers: { 
+const jsonOK = obj => new Response(JSON.stringify(obj), {
+    headers: {
         "content-type": "application/json",
         ...CORS_HEADERS
-    } 
+    }
 });
 
 const fmtResp = m => ({
@@ -259,6 +259,7 @@ export default {
 
         try {
             // --- Upload Endpoint ---
+            // --- Upload Endpoint (Fixed for JSON & CORS) ---
             if (req.method === "POST" && path === "/upload") {
                 const key = req.headers.get("x-api-key");
                 if (!key || key !== env.MASTER_API_KEY) return jsonErr(401, "Unauthorized");
@@ -269,40 +270,92 @@ export default {
                 if (ultraHdr && env.ULTRA_KEY === ultraHdr) plan = "ultra";
                 else if (proHdr && env.PRO_KEY === proHdr) plan = "pro";
 
-                let name = "", expiration = 0, mime = "application/octet-stream", body = null;
+                let name = "";
+                let expiration = 0;
+                let mime = "application/octet-stream";
+                let body = null;
+
+                // Determine Content-Type
                 const ct = (req.headers.get("content-type") || "").toLowerCase();
 
+                // 1. Handle Multipart Form Data (File Uploads)
                 if (ct.includes("multipart/form-data")) {
                     const form = await req.formData();
-                    const item = form.get("image");
-                    if (!item) return jsonErr(400, "image required");
+                    const item = form.get("image") || form.get("file"); // Support 'image' or 'file' key
+
+                    if (!item) return jsonErr(400, "image field required");
+
                     name = (form.get("name") || "") + "";
                     expiration = Number(form.get("expiration") || 0);
 
                     if (item instanceof Blob) {
+                        // It's an actual file
                         const ab = await item.arrayBuffer();
                         if (ab.byteLength > MAX * 1024 * 1024) return jsonErr(413, "too large");
+
                         const dm = detectMime(ab);
-                        mime = item.type && item.type !== "application/octet-stream" ? item.type : (dm || item.type || "application/octet-stream");
+                        mime = item.type && item.type !== "application/octet-stream"
+                            ? item.type
+                            : (dm || item.type || "application/octet-stream");
                         body = ab;
                     } else if (typeof item === "string") {
+                        // It's a string in a multipart field (URL or Base64)
                         const out = await handleStringInput(item);
                         if (out.err) return jsonErr(400, out.err);
                         mime = out.mime || mime;
                         body = out.body;
-                    } else return jsonErr(400, "invalid image field");
+                    } else {
+                        return jsonErr(400, "invalid image field");
+                    }
                 }
+                // 2. Handle JSON or URL-Encoded (Base64/URL strings)
                 else {
-                    const j = await req.json().catch(() => ({}));
-                    const img = j.image;
-                    name = (j.name || "") + "";
-                    expiration = Number(j.expiration || 0);
-                    if (!img) return jsonErr(400, "image missing");
-                    const out = await handleStringInput(String(img));
+                    let inputImage = null;
+
+                    // A. Try parsing as JSON
+                    if (ct.includes("application/json")) {
+                        try {
+                            const j = await req.json();
+                            // Accept 'image', 'url', or 'file' keys
+                            inputImage = j.image || j.url || j.file;
+                            name = (j.name || "") + "";
+                            expiration = Number(j.expiration || 0);
+                        } catch (e) {
+                            return jsonErr(400, "invalid json format");
+                        }
+                    }
+                    // B. Try parsing as URL-Encoded (Postman default for key/value)
+                    else if (ct.includes("application/x-www-form-urlencoded")) {
+                        try {
+                            const form = await req.formData();
+                            inputImage = form.get("image") || form.get("url") || form.get("file");
+                            name = (form.get("name") || "") + "";
+                            expiration = Number(form.get("expiration") || 0);
+                        } catch (e) {
+                            return jsonErr(400, "invalid form data");
+                        }
+                    }
+                    // C. Fallback: Treat raw body as the image string (rare but useful)
+                    else {
+                        try {
+                            const text = await req.text();
+                            // Only use raw body if it looks like a URL or DataURI
+                            if (text.startsWith("http") || text.startsWith("data:")) {
+                                inputImage = text;
+                            }
+                        } catch (e) { }
+                    }
+
+                    if (!inputImage) return jsonErr(400, "image missing");
+
+                    const out = await handleStringInput(String(inputImage));
                     if (out.err) return jsonErr(400, out.err);
                     mime = out.mime || mime;
                     body = out.body;
                 }
+
+                // --- Common Save Logic ---
+                if (!body) return jsonErr(400, "processing failed");
 
                 const id = randId();
                 const nm = (name || id).replace(/\s+/g, "_");
@@ -312,21 +365,43 @@ export default {
                 const publicUrl = `https://${host}/i/${id}`;
                 const ts = now();
 
+                // Save to R2
                 await saveR2(env, fname, body, mime);
 
+                // Get Dimensions (if possible)
                 let width = 0, height = 0;
                 try {
-                    const d = await getDims(new Blob([body]));
-                    width = d.width; height = d.height;
+                    // Note: createImageBitmap might not work in all Worker envs, checks are good
+                    if (mime.startsWith("image/")) {
+                        const d = await getDims(new Blob([body]));
+                        width = d.width; height = d.height;
+                    }
                 } catch { }
 
-                const meta = { id, name: nm, filename: fname, mime, extension: ext, url: publicUrl, width, height, size: body.byteLength || 0, time: ts, expiration: expiration || 0, plan };
+                // Save Metadata to KV
+                const meta = {
+                    id,
+                    name: nm,
+                    filename: fname,
+                    mime,
+                    extension: ext,
+                    url: publicUrl,
+                    width,
+                    height,
+                    size: body.byteLength || 0,
+                    time: ts,
+                    expiration: expiration || 0,
+                    plan
+                };
+
                 const token = await hmac(env.DELETE_SECRET, `${id}:${ts}`);
                 meta.delete_url = `https://${host}/delete/${id}/${token}`;
 
                 await env[META_BINDING].put(id, JSON.stringify(meta));
+
                 return jsonOK(fmtResp(meta));
             }
+
 
             // --- Public View Endpoint ---
             if (req.method === "GET" && path.startsWith("/i/")) {
@@ -347,13 +422,13 @@ export default {
                 const mainFile = meta?.filename || `${id}.jpeg`;
                 const ro = await getR2(env, mainFile);
                 if (ro) {
-                    const r = new Response(ro.ab, { 
-                        headers: { 
-                            ...Object.fromEntries(ro.h), 
-                            ...CACHE_HEADERS, 
+                    const r = new Response(ro.ab, {
+                        headers: {
+                            ...Object.fromEntries(ro.h),
+                            ...CACHE_HEADERS,
                             "Content-Disposition": `inline; filename="${mainFile}"`,
                             ...CORS_HEADERS // Include CORS here too for JS fetch()
-                        } 
+                        }
                     });
                     await cache.put(ck, r.clone());
                     return r;
@@ -420,10 +495,10 @@ export default {
                 const stub = env[DO_BINDING].get(id);
                 // We must return response with CORS headers, but DO returns "raw" response
                 const res = await stub.fetch("https://do/status");
-                
+
                 // Proxy logic: recreate response to attach CORS
                 const data = await res.json();
-                return jsonOK(data); 
+                return jsonOK(data);
             }
 
             // --- Delete Confirmation Page ---
